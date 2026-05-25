@@ -223,6 +223,52 @@ Verification:
 - `make test-kv-cache-benefit`
 - `git status --short`
 
+## 7. Git + KV Self-Improvement E2E
+
+This test belongs on the Git+KV integration branch, not on the KV-only branch,
+because it intentionally uses both tool families in the same DS4-generated
+workflow.
+
+It means:
+
+- The harness creates a temporary Git repository with a small broken Python
+  project.
+- DS4 uses the native `git` tool to inspect repository state and inspect the
+  resulting patch.
+- DS4 uses the context tool to checkpoint before the fix, checkpoint after the
+  passing fix, and restore the post-fix checkpoint from KV.
+- DS4 edits the broken file, runs the test suite before and after restore, and
+  writes a ledger proving the loop completed.
+
+Before:
+
+```text
+tool features tested separately -> no proof they compose in one agent loop
+```
+
+Now:
+
+```text
+Git inspection + KV checkpoint/restore + code edit + test run -> one verified self-improvement loop
+```
+
+How it is implemented:
+
+- `make test-agent-self-improvement` runs
+  `tests/ds4_agent_self_improvement_e2e.sh`.
+- The test uses a temporary repository, so it does not mutate the DS4 working
+  tree.
+- Git mutations are avoided because non-interactive agent runs cannot ask the
+  user for approval; file changes are made through the normal edit tool, while
+  Git is used for repository inspection.
+
+Verification:
+
+- The temporary project test suite must pass after DS4's edit.
+- The output must show `git status`, `git diff`, context checkpoint, and
+  context restore tool use.
+- The ledger must report both Git and context/KV steps as completed.
+
 ## Test Plan
 
 Run:
@@ -230,6 +276,7 @@ Run:
 ```sh
 make test
 make test-agent-context-compact-canary
+make test-agent-self-improvement
 make test-kv-cache-benefit
 git status --short
 ```
@@ -238,6 +285,7 @@ Expected result:
 
 - default C tests pass,
 - compaction canary e2e passes,
+- Git+KV self-improvement e2e passes on the integration branch,
 - KV benefit benchmark reports a large `saved_prefill_tokens` value,
 - `git status --short` shows only intentional source changes before commit, and
   is clean after commit.
