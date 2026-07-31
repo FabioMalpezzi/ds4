@@ -35,6 +35,8 @@
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#include <libproc.h>
+#include <sys/resource.h>
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -20043,6 +20045,36 @@ static bool metal_graph_use_iq2_selected_async_load(const ds4_gpu_graph *g) {
 #endif
 }
 
+/* COMET S1 P2 direzione 2: opt-in via env, so the A/B runs on one binary. */
+static bool metal_graph_use_streaming_spec_next_layer(const ds4_gpu_graph *g) {
+    if (!g || !g->ssd_streaming) return false;
+    const char *v = getenv("DS4_METAL_STREAMING_EXPERT_SPEC_NEXT");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
+/* How many of the predicted experts to actually prefetch (top-N by router
+ * probability, prediction order is descending).  Fewer than the full set
+ * trades overlap coverage for less wasted I/O and less cache pollution
+ * when the prediction misses. */
+static uint32_t metal_graph_spec_next_load_count(void) {
+    static int checked = 0;
+    static uint32_t n = 0;
+    if (!checked) {
+        checked = 1;
+        n = DS4_MAX_EXPERT_USED;
+        const char *v = getenv("DS4_METAL_STREAMING_EXPERT_SPEC_NEXT_COUNT");
+        if (v && v[0]) {
+            char *end = NULL;
+            unsigned long parsed = strtoul(v, &end, 10);
+            if (end != v && *end == '\0' && parsed > 0) {
+                n = parsed > DS4_MAX_EXPERT_USED ? DS4_MAX_EXPERT_USED
+                                                 : (uint32_t)parsed;
+            }
+        }
+    }
+    return n < DS4_N_EXPERT_USED ? n : DS4_N_EXPERT_USED;
+}
+
 static bool metal_graph_use_iq2_selected_async_early_commit(
         const ds4_gpu_graph *g) {
     return g &&
@@ -20890,6 +20922,16 @@ typedef struct metal_graph_selected_async_load {
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
+    /* Speculative next-layer routing (COMET S1 P2 direzione 2): the worker
+     * predicts layer il+1's experts from this layer's normed hidden state
+     * (exact for hash-routed layers), so the main thread can start their
+     * load right after this layer's MoE dispatch. */
+    ds4_gpu_tensor           *spec_ffn_norm;
+    const ds4_layer_weights  *spec_layer;
+    uint32_t                  spec_il;
+    int                       spec_token;
+    bool                      spec_ok;
+    int32_t                   spec_ids[DS4_MAX_EXPERT_USED];
 } metal_graph_selected_async_load;
 
 static pthread_mutex_t g_metal_graph_selected_async_load_mutex =
@@ -20964,6 +21006,51 @@ static void metal_graph_selected_async_load_run(
         return;
     }
 
+    /* Speculative routing for layer il+1 while the GPU computes this
+     * layer: hash-routed layers are exact from the token id; top-k layers
+     * apply the next router to this layer's normed hidden state (one-layer
+     * approximation).  Cost lives on this worker thread, off the decode
+     * critical path. */
+    if (job->spec_layer && job->spec_layer->ffn_gate_exps) {
+        int selected[DS4_MAX_EXPERT_USED];
+        bool have = false;
+        if (job->spec_layer->ffn_gate_tid2eid) {
+            layer_hash_selected_experts(selected,
+                                        job->model,
+                                        job->spec_layer,
+                                        job->spec_token);
+            have = true;
+        } else if (job->spec_ffn_norm && job->spec_layer->ffn_gate_inp) {
+            static float *spec_h = NULL;
+            if (!spec_h) spec_h = malloc((size_t)DS4_MAX_EMBD * sizeof(float));
+            float logits[DS4_MAX_EXPERT];
+            float probs[DS4_MAX_EXPERT];
+            float wts[DS4_MAX_EXPERT_USED];
+            if (spec_h &&
+                ds4_gpu_tensor_read(job->spec_ffn_norm,
+                                    0,
+                                    spec_h,
+                                    (uint64_t)DS4_N_EMBD * sizeof(float)) != 0) {
+                matvec_any(logits, job->model, job->spec_layer->ffn_gate_inp, spec_h);
+                for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+                    probs[i] = sqrtf(softplus_stable(logits[i]));
+                }
+                layer_topk_selected_experts_from_probs(selected,
+                                                       wts,
+                                                       job->model,
+                                                       job->spec_layer,
+                                                       probs);
+                have = true;
+            }
+        }
+        if (have) {
+            for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                job->spec_ids[i] = (int32_t)selected[i];
+            }
+            job->spec_ok = true;
+        }
+    }
+
     job->ok = true;
 }
 
@@ -21027,7 +21114,11 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
         uint32_t                         il,
         uint64_t                         event_value,
         uint64_t                         gate_expert_bytes,
-        uint64_t                         down_expert_bytes) {
+        uint64_t                         down_expert_bytes,
+        ds4_gpu_tensor                  *spec_ffn_norm,
+        const ds4_layer_weights         *spec_layer,
+        uint32_t                         spec_il,
+        int                              spec_token) {
     if (!job || !router_selected || event_value == 0) return false;
     if (!metal_graph_selected_async_load_ensure_worker()) return false;
     memset(job, 0, sizeof(*job));
@@ -21038,6 +21129,10 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     job->event_value = event_value;
     job->gate_expert_bytes = gate_expert_bytes;
     job->down_expert_bytes = down_expert_bytes;
+    job->spec_ffn_norm = spec_ffn_norm;
+    job->spec_layer = spec_layer;
+    job->spec_il = spec_il;
+    job->spec_token = spec_token;
 
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
     if (g_metal_graph_selected_async_load_has_job ||
@@ -21060,9 +21155,13 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
         const ds4_model                 *model,
         const ds4_layer_weights         *layer,
         uint32_t                         il,
+        int                              token,
         uint64_t                         event_value,
         uint64_t                         gate_expert_bytes,
         uint64_t                         down_expert_bytes) {
+    const bool spec =
+        metal_graph_use_streaming_spec_next_layer(g) &&
+        il + 1 < DS4_N_LAYER;
     return metal_graph_selected_async_load_start_tensor(
             job,
             g ? metal_graph_router_selected(g) : NULL,
@@ -21071,7 +21170,11 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
             il,
             event_value,
             gate_expert_bytes,
-            down_expert_bytes);
+            down_expert_bytes,
+            spec && g ? metal_graph_ffn_norm(g) : NULL,
+            spec ? layer + 1 : NULL,
+            il + 1,
+            token);
 }
 
 static bool metal_graph_selected_async_load_finish(
@@ -21089,6 +21192,47 @@ static bool metal_graph_selected_async_load_finish(
     if (!job->ok) return false;
     return ds4_gpu_routed_moe_set_selected_override(job->selected_ids,
                                                    DS4_N_EXPERT_USED) != 0;
+}
+
+/* Accuracy accounting for the speculative next-layer prefetch: the
+ * prediction for layer il is scored when layer il's real selection is
+ * known on the next iteration. */
+static uint32_t g_spec_next_pred_il = UINT32_MAX;
+static int32_t  g_spec_next_pred_ids[DS4_MAX_EXPERT_USED];
+static uint64_t g_spec_next_pred_total;
+static uint64_t g_spec_next_pred_hits;
+
+static void metal_graph_spec_next_note_prediction(uint32_t       il,
+                                                  const int32_t *ids) {
+    g_spec_next_pred_il = il;
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        g_spec_next_pred_ids[i] = ids[i];
+    }
+}
+
+static void metal_graph_spec_next_note_actual(uint32_t       il,
+                                              const int32_t *ids) {
+    if (il != g_spec_next_pred_il) return;
+    g_spec_next_pred_il = UINT32_MAX;
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        g_spec_next_pred_total++;
+        for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
+            if (ids[i] == g_spec_next_pred_ids[j]) {
+                g_spec_next_pred_hits++;
+                break;
+            }
+        }
+    }
+}
+
+static void metal_graph_spec_next_report(void) {
+    if (g_spec_next_pred_total == 0) return;
+    fprintf(stderr,
+            "ds4: spec next-layer prefetch accuracy: %llu/%llu selected experts predicted (%.1f%%)\n",
+            (unsigned long long)g_spec_next_pred_hits,
+            (unsigned long long)g_spec_next_pred_total,
+            100.0 * (double)g_spec_next_pred_hits /
+                (double)g_spec_next_pred_total);
 }
 
 #ifdef DS4_ROCM_BUILD
@@ -23379,6 +23523,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                        model,
                                                        layer,
                                                        il,
+                                                       token,
                                                        selected_event,
                                                        gate_expert_bytes,
                                                        down_expert_bytes);
@@ -23500,6 +23645,45 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      il,
                                                      false) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+        /* Speculative next-layer early load (COMET S1 P2): the pending-load
+         * slot is free again (consumed at this layer's MoE bind), the GPU is
+         * busy with the encoded work, and the worker has predicted layer
+         * il+1's experts.  Begin their load now so the preads overlap the
+         * GPU; layer il+1's own load will either match this pending batch or
+         * clear-install it and top up the difference.  This layer's kernel
+         * is encoded but not executed: shield its experts from evictions. */
+        if (ok && async_load_started && async_load.ids_ok) {
+            metal_graph_spec_next_note_actual(il, async_load.selected_ids);
+        }
+        if (ok && async_load_started && async_load.spec_ok &&
+            async_load.ids_ok &&
+            async_load.spec_layer &&
+            async_load.spec_layer->ffn_gate_exps &&
+            async_load.spec_layer->ffn_up_exps &&
+            async_load.spec_layer->ffn_down_exps) {
+            const ds4_layer_weights *nl = async_load.spec_layer;
+            const uint64_t spec_gate_bytes =
+                nl->ffn_gate_exps->dim[1] *
+                routed_expert_row_bytes(nl->ffn_gate_exps);
+            const uint64_t spec_down_bytes =
+                nl->ffn_down_exps->dim[1] *
+                routed_expert_row_bytes(nl->ffn_down_exps);
+            const ds4_gpu_stream_expert_table spec_table =
+                graph_stream_expert_table_make(model,
+                                               nl,
+                                               async_load.spec_il,
+                                               spec_gate_bytes,
+                                               spec_down_bytes);
+            ds4_gpu_stream_expert_cache_set_extra_protect(
+                    il, async_load.selected_ids, DS4_N_EXPERT_USED);
+            (void)ds4_gpu_stream_expert_cache_begin_selected_load(
+                    &spec_table,
+                    async_load.spec_ids,
+                    metal_graph_spec_next_load_count());
+            ds4_gpu_stream_expert_cache_clear_extra_protect();
+            metal_graph_spec_next_note_prediction(async_load.spec_il,
+                                                  async_load.spec_ids);
+        }
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
                                           (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -40073,7 +40257,11 @@ static bool glm_graph_encode_sparse_ffn_one(
                         il,
                         selected_event,
                         gate_out * gate_row_bytes,
-                        down_out * down_row_bytes);
+                        down_out * down_row_bytes,
+                        NULL,
+                        NULL,
+                        0,
+                        0);
                 async_path_profiled = async_profile && async_load_started;
             }
             if (async_profile) {
@@ -46585,6 +46773,113 @@ static int generate_glm_metal_argmax(
     return 0;
 }
 
+/*
+ * SSD-streaming measurement mode (COMET fase S1): when
+ * DS4_STREAMING_MEASURE_INVALIDATE is set, the routed-expert file pages are
+ * dropped from the unified page cache after every decoded token, so each
+ * expert-cache miss and each bypass-layer read pays the SSD the way it would
+ * on a memory-constrained machine.  msync(MS_INVALIDATE) is used because it
+ * is the only primitive that actually evicts clean file-backed pages on
+ * Darwin (madvise variants leave them cached).  Attention/dense weights and
+ * the resident views are intentionally left alone: a real 48 GB machine
+ * would keep those hot.
+ */
+/* Returns the invalidation interval in decoded tokens (0 = mode disabled).
+ * The env value is the interval: "1" invalidates after every token (strict,
+ * ~40 ms/token of msync overhead on the 91 GB model), "8" amortizes the
+ * overhead while leaving a reuse window comparable to the page-cache slack
+ * a memory-constrained machine would grant anyway. */
+static int metal_graph_stream_measure_invalidate_interval(void) {
+    const char *v = getenv("DS4_STREAMING_MEASURE_INVALIDATE");
+    if (!v || !v[0] || strcmp(v, "0") == 0) return 0;
+    const int n = atoi(v);
+    return n > 0 ? n : 1;
+}
+
+static void metal_graph_stream_measure_invalidate(const ds4_model   *model,
+                                                  const ds4_weights *weights) {
+    const long page_long = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_long > 0 ? (uint64_t)page_long : 4096ull;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        const ds4_tensor *t[3] = { l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps };
+        for (int i = 0; i < 3; i++) {
+            if (!t[i] || t[i]->bytes == 0) continue;
+            uint64_t start = t[i]->abs_offset & ~(page - 1u);
+            uint64_t end = t[i]->abs_offset + t[i]->bytes;
+            if (end > model->size) end = model->size;
+            if (end <= start) continue;
+            /* Best effort: a failed invalidation only makes the measure
+             * optimistic, and the disk-read accounting exposes that. */
+            (void)msync((void *)(model->map + start), (size_t)(end - start),
+                        MS_INVALIDATE);
+        }
+    }
+}
+
+/* Diagnostic for the measurement mode: how much of the routed-expert file
+ * range is still resident right after an invalidation pass.  Pages that
+ * survive msync(MS_INVALIDATE) are effectively pinned (e.g. wired for
+ * no-copy Metal buffers) and the measurement cannot make them pay the SSD. */
+static void metal_graph_stream_measure_report_residency(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const char        *label) {
+    const long page_long = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_long > 0 ? (uint64_t)page_long : 4096ull;
+    char *vec = NULL;
+    size_t vec_cap = 0;
+    uint64_t res_slab = 0, tot_slab = 0, res_byp = 0, tot_byp = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        const ds4_tensor *t[3] = { l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps };
+        const bool uniform = weights_streaming_layer_experts_uniform(weights, il);
+        for (int i = 0; i < 3; i++) {
+            if (!t[i] || t[i]->bytes == 0) continue;
+            uint64_t start = t[i]->abs_offset & ~(page - 1u);
+            uint64_t end = t[i]->abs_offset + t[i]->bytes;
+            if (end > model->size) end = model->size;
+            if (end <= start) continue;
+            const size_t len = (size_t)(end - start);
+            const size_t npages = (len + page - 1u) / page;
+            if (npages > vec_cap) {
+                char *nv = realloc(vec, npages);
+                if (!nv) { free(vec); return; }
+                vec = nv;
+                vec_cap = npages;
+            }
+            if (mincore((void *)(model->map + start), len, vec) != 0) continue;
+            uint64_t res = 0;
+            for (size_t p = 0; p < npages; p++) res += (uint64_t)(vec[p] & 1);
+            if (uniform) { res_slab += res * page; tot_slab += len; }
+            else         { res_byp  += res * page; tot_byp  += len; }
+        }
+    }
+    free(vec);
+    fprintf(stderr,
+            "ds4: measure mode: residency %s: slab %.2f/%.2f GiB (%.0f%%), "
+            "bypass %.2f/%.2f GiB (%.0f%%)\n",
+            label,
+            (double)res_slab / (double)(1ull << 30),
+            (double)tot_slab / (double)(1ull << 30),
+            tot_slab ? 100.0 * (double)res_slab / (double)tot_slab : 0.0,
+            (double)res_byp / (double)(1ull << 30),
+            (double)tot_byp / (double)(1ull << 30),
+            tot_byp ? 100.0 * (double)res_byp / (double)tot_byp : 0.0);
+}
+
+/* Disk bytes actually read by this process (page-ins included), for the
+ * decode-phase accounting of the measurement mode. 0 when unavailable. */
+static uint64_t metal_graph_stream_process_disk_bytes_read(void) {
+#if defined(__APPLE__)
+    struct rusage_info_v4 ri;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ri) == 0) {
+        return ri.ri_diskio_bytesread;
+    }
+#endif
+    return 0;
+}
+
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
  * use decode-style prefill for short prompts. */
@@ -46722,6 +47017,22 @@ static int generate_metal_graph_raw_swa(
         fprintf(stderr, "ds4: wrote GPU prefill logits to %s\n", dump_prefill_logits);
     }
 
+    const int measure_interval =
+        ssd_streaming ? metal_graph_stream_measure_invalidate_interval() : 0;
+    const bool measure_invalidate = measure_interval > 0;
+    uint64_t measure_disk_read0 = 0;
+    double measure_msync_s = 0.0;
+    if (measure_invalidate) {
+        metal_graph_stream_measure_invalidate(model, weights);
+        measure_disk_read0 = metal_graph_stream_process_disk_bytes_read();
+        fprintf(stderr,
+                "ds4: measure mode: invalidating routed-expert pages every "
+                "%d decoded token(s) (prefill warmth dropped)\n",
+                measure_interval);
+        metal_graph_stream_measure_report_residency(model, weights,
+                                                    "after initial purge");
+    }
+
     int pos = prompt->len;
     int n_generated = 0;
     int n_decode_eval = 0;
@@ -46756,6 +47067,11 @@ static int generate_metal_graph_raw_swa(
             const double t_eval1 = now_sec();
             fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
         }
+        if (measure_invalidate && (n_decode_eval + 1) % measure_interval == 0) {
+            const double t_m0 = now_sec();
+            metal_graph_stream_measure_invalidate(model, weights);
+            measure_msync_s += now_sec() - t_m0;
+        }
         n_decode_eval++;
         pos++;
     }
@@ -46770,6 +47086,24 @@ static int generate_metal_graph_raw_swa(
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
 
+    if (measure_invalidate) {
+        const uint64_t disk_read1 = metal_graph_stream_process_disk_bytes_read();
+        const double read_gib =
+            (double)(disk_read1 - measure_disk_read0) / (double)(1ull << 30);
+        fprintf(stderr,
+                "ds4: measure mode: decode disk reads %.2f GiB over %d tokens "
+                "(%.1f MiB/token), msync overhead %.2f ms/token\n",
+                read_gib,
+                n_generated,
+                n_generated > 0 ? read_gib * 1024.0 / (double)n_generated : 0.0,
+                n_generated > 0 ? measure_msync_s * 1000.0 / (double)n_generated
+                                : 0.0);
+        metal_graph_stream_measure_invalidate(model, weights);
+        metal_graph_stream_measure_report_residency(model, weights,
+                                                    "after final purge");
+    }
+
+    metal_graph_spec_next_report();
     if (memory_report) ds4_gpu_print_memory_report("before graph free");
     free(logits);
     metal_graph_free(&g);

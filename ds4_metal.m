@@ -10724,6 +10724,10 @@ typedef struct {
     int ok;
 } ds4_gpu_stream_expert_pread_task;
 
+/* Max read-chunks per tensor for the fill-bandwidth chunking (COMET S1
+ * Parte 2, direzione 1); see ds4_gpu_stream_expert_pread_push_chunked. */
+#define DS4_METAL_STREAM_EXPERT_PREAD_MAX_CHUNKS 4u
+
 typedef struct {
     int active;
     const void *model_map;
@@ -10748,7 +10752,8 @@ typedef struct {
     NSUInteger gate_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     NSUInteger up_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     NSUInteger down_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
-    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u];
+    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u *
+                                           DS4_METAL_STREAM_EXPERT_PREAD_MAX_CHUNKS];
     double start_ms;
     double prepare_ms;
 } ds4_gpu_stream_expert_pending_load;
@@ -10819,6 +10824,67 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
     uint32_t threads = ds4_gpu_stream_expert_pread_thread_limit();
     if (threads > n_tasks) threads = n_tasks;
     return threads;
+}
+
+/* COMET fase S1 (Parte 2, direzione 1): in decode the typical fill batch is
+ * one missing expert = 3 tensor reads, so only 3 of the pool's readers are
+ * busy and the effective fill bandwidth sits far below the 8-reader
+ * benchmark.  Splitting each tensor read into chunks keeps the pool busy
+ * even for a single missing expert.  Chunk size in KiB via
+ * DS4_METAL_STREAMING_EXPERT_PREAD_CHUNK_KIB (0 disables chunking). */
+static uint64_t ds4_gpu_stream_expert_pread_chunk_bytes(void) {
+    static int checked = 0;
+    static uint64_t chunk = 0;
+    if (!checked) {
+        checked = 1;
+        uint64_t kib = 1024;
+        const char *env = getenv("DS4_METAL_STREAMING_EXPERT_PREAD_CHUNK_KIB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && *end == '\0') kib = (uint64_t)v;
+        }
+        chunk = kib * 1024ull;
+    }
+    return chunk;
+}
+
+static uint32_t ds4_gpu_stream_expert_pread_task_chunks(uint64_t len) {
+    const uint64_t chunk = ds4_gpu_stream_expert_pread_chunk_bytes();
+    if (chunk == 0 || len <= chunk) return 1;
+    const uint64_t n = (len + chunk - 1) / chunk;
+    return n > DS4_METAL_STREAM_EXPERT_PREAD_MAX_CHUNKS ?
+           DS4_METAL_STREAM_EXPERT_PREAD_MAX_CHUNKS : (uint32_t)n;
+}
+
+/* Task arrays at every call site are dimensioned for MAX_CHUNKS chunks per
+ * tensor, so the capacity clamp below is unreachable in practice; it exists
+ * so a sizing mistake degrades to fewer, larger reads instead of a lost
+ * read. */
+static uint32_t ds4_gpu_stream_expert_pread_push_chunked(
+        ds4_gpu_stream_expert_pread_task *tasks,
+        uint32_t  n_tasks,
+        uint32_t  cap,
+        uint64_t  offset,
+        uint64_t  len,
+        uint8_t  *dst) {
+    const uint32_t avail = cap > n_tasks ? cap - n_tasks : 0;
+    if (avail == 0 || len == 0 || !dst) return n_tasks;
+    uint32_t n_chunks = ds4_gpu_stream_expert_pread_task_chunks(len);
+    if (n_chunks > avail) n_chunks = 1;
+    const uint64_t stride = (len + n_chunks - 1) / n_chunks;
+    uint64_t pos = 0;
+    while (pos < len) {
+        const uint64_t rem = len - pos;
+        const uint64_t chunk_len = rem < stride ? rem : stride;
+        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = offset + pos,
+            .len = chunk_len,
+            .dst = dst + pos,
+        };
+        pos += chunk_len;
+    }
+    return n_tasks;
 }
 
 static int ds4_gpu_stream_expert_pread_into(
@@ -12582,6 +12648,36 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
     }
 }
 
+/* Secondary protect set for speculative next-layer loads (COMET S1 P2):
+ * armed on the main thread strictly around the speculative begin (whose
+ * evictions run synchronously in its prepare), cleared before any other
+ * cache path can run. */
+static uint32_t g_stream_expert_cache_extra_protect_layer = UINT32_MAX;
+static int32_t g_stream_expert_cache_extra_protect_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+static uint32_t g_stream_expert_cache_extra_protect_count;
+
+void ds4_gpu_stream_expert_cache_set_extra_protect(
+        uint32_t       layer,
+        const int32_t *ids,
+        uint32_t       n_ids) {
+    if (!ids || n_ids == 0 ||
+        n_ids > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED) {
+        g_stream_expert_cache_extra_protect_layer = UINT32_MAX;
+        g_stream_expert_cache_extra_protect_count = 0;
+        return;
+    }
+    for (uint32_t i = 0; i < n_ids; i++) {
+        g_stream_expert_cache_extra_protect_ids[i] = ids[i];
+    }
+    g_stream_expert_cache_extra_protect_count = n_ids;
+    g_stream_expert_cache_extra_protect_layer = layer;
+}
+
+void ds4_gpu_stream_expert_cache_clear_extra_protect(void) {
+    g_stream_expert_cache_extra_protect_layer = UINT32_MAX;
+    g_stream_expert_cache_extra_protect_count = 0;
+}
+
 static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t layer,
         uint32_t expert,
@@ -12592,6 +12688,13 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
         expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
         ds4_gpu_stream_expert_cache_entry_inflight(
                 &g_stream_expert_cache[layer][expert])) {
+        return 1;
+    }
+    if (layer == g_stream_expert_cache_extra_protect_layer &&
+        ds4_gpu_stream_expert_cache_is_protected(
+                expert,
+                g_stream_expert_cache_extra_protect_ids,
+                g_stream_expert_cache_extra_protect_count)) {
         return 1;
     }
     return layer == protect_layer &&
@@ -13317,26 +13420,20 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
     uint8_t *down_dst = (uint8_t *)[down_buf contents] + down_inner;
     if (!gate_dst || !up_dst || !down_dst) return NULL;
 
-    ds4_gpu_stream_expert_pread_task tasks[3] = {
-        {
-            .offset = gate_abs_offset,
-            .len = gate_expert_bytes,
-            .dst = gate_dst,
-        },
-        {
-            .offset = up_abs_offset,
-            .len = gate_expert_bytes,
-            .dst = up_dst,
-        },
-        {
-            .offset = down_abs_offset,
-            .len = down_expert_bytes,
-            .dst = down_dst,
-        },
-    };
+    ds4_gpu_stream_expert_pread_task
+        tasks[3u * DS4_METAL_STREAM_EXPERT_PREAD_MAX_CHUNKS];
+    memset(tasks, 0, sizeof(tasks));
+    const uint32_t task_cap = (uint32_t)(sizeof(tasks) / sizeof(tasks[0]));
+    uint32_t n_tasks = 0;
+    n_tasks = ds4_gpu_stream_expert_pread_push_chunked(
+            tasks, n_tasks, task_cap, gate_abs_offset, gate_expert_bytes, gate_dst);
+    n_tasks = ds4_gpu_stream_expert_pread_push_chunked(
+            tasks, n_tasks, task_cap, up_abs_offset, gate_expert_bytes, up_dst);
+    n_tasks = ds4_gpu_stream_expert_pread_push_chunked(
+            tasks, n_tasks, task_cap, down_abs_offset, down_expert_bytes, down_dst);
     uint64_t read_bytes = 0;
     double read_ms = 0.0;
-    if (!ds4_gpu_stream_expert_pread_tasks(tasks, 3, &read_bytes, &read_ms)) {
+    if (!ds4_gpu_stream_expert_pread_tasks(tasks, n_tasks, &read_bytes, &read_ms)) {
         return NULL;
     }
     ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
@@ -13346,10 +13443,11 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
     [down_buf didModifyRange:NSMakeRange(down_inner, (NSUInteger)down_expert_bytes)];
     if (getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
         fprintf(stderr,
-                "ds4: Metal streaming expert parallel pread layer=%u experts=1 tensors=3 "
+                "ds4: Metal streaming expert parallel pread layer=%u experts=1 tasks=%u "
                 "threads=%u bytes=%.2f GiB wall=%.3f ms\n",
                 layer,
-                ds4_gpu_stream_expert_pread_thread_count(3),
+                n_tasks,
+                ds4_gpu_stream_expert_pread_thread_count(n_tasks),
                 ds4_gpu_gib(read_bytes),
                 read_ms);
     }
@@ -13796,21 +13894,17 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
             return 0;
         }
         const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->gate_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = gate_dst,
-        };
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->up_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = up_dst,
-        };
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->down_abs_offsets[slot],
-            .len = down_expert_bytes,
-            .dst = down_dst,
-        };
+        const uint32_t pending_task_cap =
+            (uint32_t)(sizeof(p->tasks) / sizeof(p->tasks[0]));
+        p->n_tasks = ds4_gpu_stream_expert_pread_push_chunked(
+                p->tasks, p->n_tasks, pending_task_cap,
+                p->gate_abs_offsets[slot], gate_expert_bytes, gate_dst);
+        p->n_tasks = ds4_gpu_stream_expert_pread_push_chunked(
+                p->tasks, p->n_tasks, pending_task_cap,
+                p->up_abs_offsets[slot], gate_expert_bytes, up_dst);
+        p->n_tasks = ds4_gpu_stream_expert_pread_push_chunked(
+                p->tasks, p->n_tasks, pending_task_cap,
+                p->down_abs_offsets[slot], down_expert_bytes, down_dst);
         if (load_timing) {
             ds4_gpu_stream_expert_timing_note_prepare_task(
                     1,
@@ -13989,7 +14083,8 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         up_inners[i] = 0;
         down_inners[i] = 0;
     }
-    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u];
+    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u *
+                                           DS4_METAL_STREAM_EXPERT_PREAD_MAX_CHUNKS];
     memset(tasks, 0, sizeof(tasks));
     uint32_t n_tasks = 0;
     const uint32_t cache_budget =
@@ -14087,21 +14182,17 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         if (!gate_dst || !up_dst || !down_dst) return 0;
 
         const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
-        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = gate_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = gate_dst,
-        };
-        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = up_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = up_dst,
-        };
-        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = down_abs_offsets[slot],
-            .len = down_expert_bytes,
-            .dst = down_dst,
-        };
+        const uint32_t batch_task_cap =
+            (uint32_t)(sizeof(tasks) / sizeof(tasks[0]));
+        n_tasks = ds4_gpu_stream_expert_pread_push_chunked(
+                tasks, n_tasks, batch_task_cap,
+                gate_abs_offsets[slot], gate_expert_bytes, gate_dst);
+        n_tasks = ds4_gpu_stream_expert_pread_push_chunked(
+                tasks, n_tasks, batch_task_cap,
+                up_abs_offsets[slot], gate_expert_bytes, up_dst);
+        n_tasks = ds4_gpu_stream_expert_pread_push_chunked(
+                tasks, n_tasks, batch_task_cap,
+                down_abs_offsets[slot], down_expert_bytes, down_dst);
         if (load_timing) {
             ds4_gpu_stream_expert_timing_note_prepare_task(
                     1,

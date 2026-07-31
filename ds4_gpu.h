@@ -174,6 +174,14 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+/* COMET S1 Parte 2 (direzione 2): while a speculative next-layer load runs,
+ * the current layer's MoE kernel is encoded but not yet executed, so its
+ * cache entries must be shielded from the speculative load's evictions. */
+void ds4_gpu_stream_expert_cache_set_extra_protect(
+        uint32_t       layer,
+        const int32_t *ids,
+        uint32_t       n_ids);
+void ds4_gpu_stream_expert_cache_clear_extra_protect(void);
 int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
