@@ -1380,6 +1380,21 @@ static void ds4_expert_profile_record(
     ds4_expert_profile *p = &g_expert_profile;
     if (!p->active || il >= p->n_layer) return;
 
+    /* COMET T-011: per-token trace dump (opt-in, formato di replay_politiche) */
+    static FILE *trace_fp = NULL;
+    static int trace_checked = 0;
+    if (!trace_checked) {
+        trace_checked = 1;
+        const char *tp = getenv("DS4_EXPERT_TRACE_JSONL");
+        if (tp && *tp) trace_fp = fopen(tp, "w");
+    }
+    if (trace_fp) {
+        fprintf(trace_fp, "{\"layer\":%u,\"pos\":%u,\"experts\":[", il, pos);
+        for (uint32_t s = 0; s < p->n_expert_used; s++)
+            fprintf(trace_fp, "%s%d", s ? "," : "", selected[s]);
+        fprintf(trace_fp, "]}\n");
+    }
+
     p->layer_records[il]++;
     p->total_records++;
     if (is_hash) p->layer_is_hash[il] = true;
